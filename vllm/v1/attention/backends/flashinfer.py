@@ -864,6 +864,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         can_use_xqa_or_trtllm_gen_decode = can_use_trtllm_attention(
             self.num_qo_heads, self.num_kv_heads, is_prefill=False
         )
+        self.use_xqa_nvfp4_decode = (
+            self.use_fa2_nvfp4_kv
+            and can_use_xqa_or_trtllm_gen_decode
+            and not self.use_dcp
+            and self.head_dim % 16 == 0
+            and self.head_dim <= 256
+        )
         # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
         # get_supported_kernel_block_sizes).
         assert self.page_size <= 64 or (
@@ -877,10 +884,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if can_use_xqa_or_trtllm_gen_decode
             else None
         )
-        if self.use_fa2_nvfp4_kv:
-            # Neither the dedicated XQA API nor trtllm-gen read NVFP4 KV on
-            # SM12x; decode (incl. spec-decode verify) goes through the native
-            # FA2 decode/prefill wrappers.
+        if self.use_fa2_nvfp4_kv and not self.use_xqa_nvfp4_decode:
+            # Without the XQA NVFP4 decode path, SM12x decode (incl. spec-decode
+            # verify) goes through the native FA2 decode/prefill wrappers.
             self.use_trtllm_decode_attention = False
             self.flashinfer_trtllm_api_decode_kernel = None
         # The dedicated FlashInfer XQA API accepts head dimensions in
@@ -914,6 +920,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.use_dedicated_xqa = (
             current_platform.is_device_capability_family(120)
             and self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
+            and not self.is_kvcache_nvfp4
         )
         # Adaptive verification trims drafts on device, so decode query lengths
         # must come from the device qo_indptr; only trtllm-gen supports that
@@ -2010,6 +2017,13 @@ class FlashInferImpl(AttentionImpl):
         else:
             self._nvfp4_fp8_out = None
 
+        if self.use_fa2_nvfp4_kv:
+            # XQA NVFP4 scale-factor views are carved from the persistent global
+            # workspace. They hold metadata only and allocate no device memory.
+            self._nvfp4_xqa_sf_shape: tuple[int, ...] | None = None
+            self._nvfp4_xqa_workspace: torch.Tensor | None = None
+            self._nvfp4_xqa_sf_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
+
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -2085,6 +2099,43 @@ class FlashInferImpl(AttentionImpl):
             return query_quantized.view(num_tokens, num_heads, head_size)
 
         return query
+
+    def _prepare_nvfp4_xqa_sf(
+        self,
+        workspace_buffer: torch.Tensor,
+        kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Copy packed-page SF views to compact, graph-stable workspace views."""
+        k_sf, v_sf = kv_cache_sf
+        assert k_sf.shape == v_sf.shape
+        assert k_sf.dtype == v_sf.dtype == torch.float8_e4m3fn
+        assert k_sf.element_size() == workspace_buffer.element_size() == 1
+
+        shape = tuple(k_sf.shape)
+        sf_bytes = 2 * k_sf.numel()
+        prefix_bytes = workspace_buffer.numel() - sf_bytes
+        semaphore_bytes = 8 * 1024 * 1024
+        if prefix_bytes <= semaphore_bytes:
+            raise RuntimeError(
+                "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE is too small for the "
+                "XQA NVFP4 scale-factor scratch; enlarge it or set "
+                "--attention-config.use_trtllm_attention=0 to decode via FA2."
+            )
+
+        # The shape changes between minimal graph profiling and the real KV
+        # pool. Rebuild only tensor metadata; the workspace backing is persistent.
+        if self._nvfp4_xqa_sf_shape != shape:
+            scratch = workspace_buffer[prefix_bytes:].view(k_sf.dtype).view(2, *shape)
+            self._nvfp4_xqa_workspace = workspace_buffer[:prefix_bytes]
+            self._nvfp4_xqa_sf_scratch = (scratch[0], scratch[1])
+            self._nvfp4_xqa_sf_shape = shape
+
+        assert self._nvfp4_xqa_workspace is not None
+        assert self._nvfp4_xqa_sf_scratch is not None
+        k_scratch, v_scratch = self._nvfp4_xqa_sf_scratch
+        k_scratch.copy_(k_sf)
+        v_scratch.copy_(v_sf)
+        return self._nvfp4_xqa_workspace, (k_scratch, v_scratch)
 
     def forward(
         self,
@@ -2260,7 +2311,9 @@ class FlashInferImpl(AttentionImpl):
 
         use_dcp = self.dcp_world_size > 1
         decode_with_dedicated_xqa = (
-            decode_with_xqa and current_platform.is_device_capability_family(120)
+            decode_with_xqa
+            and current_platform.is_device_capability_family(120)
+            and not self.is_kvcache_nvfp4
         )
         if decode_with_dedicated_xqa:
             assert not use_dcp
@@ -2566,6 +2619,14 @@ class FlashInferImpl(AttentionImpl):
                 workspace_buffer = _get_trtllm_workspace_buffer()
                 block_tables_decode = attn_metadata.decode.block_tables
                 seq_lens_decode = attn_metadata.decode.seq_lens
+                decode_kv_block_scales = nvfp4_kv_block_scales
+                if decode_with_xqa and self.is_kvcache_nvfp4:
+                    assert nvfp4_kv_block_scales is not None
+                    workspace_buffer, decode_kv_block_scales = (
+                        self._prepare_nvfp4_xqa_sf(
+                            workspace_buffer, nvfp4_kv_block_scales
+                        )
+                    )
 
                 # trtllm-gen needs HND layout on SM100. XQA is selected
                 # separately on SM90 and does not use this SM100 layout gate.
@@ -2635,9 +2696,14 @@ class FlashInferImpl(AttentionImpl):
                     assert self.o_sf_scale is None
                     out = output[:num_decode_tokens]
 
-                # NVFP4 trtllm kernel only supports FP8 output.
+                # NVFP4 trtllm-gen only supports FP8 output; XQA writes the
+                # model dtype directly.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                needs_fp8_out = (
+                    self.is_kvcache_nvfp4
+                    and decode_with_trtllm_gen
+                    and output.dtype != FP8_DTYPE
+                )
                 if needs_fp8_out:
                     out = self._nvfp4_fp8_out[:num_decode_tokens]
 
@@ -2701,7 +2767,7 @@ class FlashInferImpl(AttentionImpl):
                     max_q_len=max_q_len,
                     cum_seq_lens_q=q_cu_seq_lens,
                     kv_cache_sf=(
-                        nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                        decode_kv_block_scales if self.is_kvcache_nvfp4 else None
                     ),
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
