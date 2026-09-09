@@ -494,6 +494,10 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is not None and kv_cache_dtype.startswith("nvfp4"):
+            # SM12x (consumer/workstation Blackwell) has no trtllm-gen; the
+            # FlashInfer FA2 paged kernels read NVFP4 KV natively there.
+            if current_platform.is_device_capability_family(120):
+                return True
             return (
                 current_platform.is_device_capability_family(100)
                 and supports_trtllm_attention(is_prefill=True)
@@ -544,6 +548,17 @@ class FlashInferBackend(AttentionBackend):
             # The trtllm-gen kernels consume head-major block interiors; the L/B
             # nesting outside the block is immaterial to them.
             return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
+        if capability is not None and capability.major == 12:
+            # SM12x NVFP4 KV goes through the FlashInfer FA2 paged kernels,
+            # which take the same head-major (HND) block interior; fp8/auto on
+            # SM12x keep the default layout resolution.
+            vllm_config = get_current_vllm_config_or_none()
+            if (
+                vllm_config is not None
+                and vllm_config.cache_config is not None
+                and str(vllm_config.cache_config.cache_dtype).startswith("nvfp4")
+            ):
+                return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
         return super().supported_kv_cache_layouts()
 
     forward_includes_kv_cache_update: bool = False
@@ -767,15 +782,35 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
+            self.use_fa2_nvfp4_kv = False
             if self.is_kvcache_nvfp4:
-                if (
+                if current_platform.is_device_capability_family(120):
+                    # SM12x: FlashInfer FA2 reads NVFP4 KV natively (no trtllm-gen)
+                    self.use_fa2_nvfp4_kv = True
+                    if not (
+                        self.kv_cache_layout.is_block_compact
+                        and self.kv_cache_layout.is_block_contiguous
+                    ):
+                        # The per-side [data | scale] carve in the NVFP4
+                        # page is only byte-coherent for a head-major,
+                        # block-compact page. With NHD (LBNHC) K/V head
+                        # rows interleave per token and the scale region
+                        # lands inside the other side's data: no error,
+                        # just garbage tokens (measured 2026-09-09).
+                        raise ValueError(
+                            "NVFP4 KV cache on SM12x requires a block-compact, "
+                            "head-major KV cache layout; resolved layout is "
+                            f"{self.kv_cache_layout.name!r}. Unset "
+                            "VLLM_KV_CACHE_LAYOUT or set it to 'HND'."
+                        )
+                elif (
                     force_use_trtllm_attention() is False
                     or not supports_trtllm_attention(is_prefill=True)
                     or not supports_trtllm_attention(is_prefill=False)
                 ):
                     raise ValueError(
-                        f"--kv-cache-dtype {self.cache_dtype} requires the "
-                        "SM100 trtllm-gen "
+                        f"--kv-cache-dtype {self.cache_dtype} requires SM120 "
+                        "(FlashInfer FA2) or the SM100 trtllm-gen "
                         "FlashInfer path."
                     )
                 # The scale search only affects the store kernel. FlashInfer
@@ -788,8 +823,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             self.cache_dtype = "auto"
             self.is_kvcache_nvfp4 = False
+            self.use_fa2_nvfp4_kv = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
+
+        # Native FA2 handles speculative verification as a uniform prefill.
+        # Give only the SM12x NVFP4 path graph-bound prefill wrappers; stock
+        # FP8/auto keeps the existing XQA/decode-wrapper behavior byte-for-byte.
+        if self.enable_cuda_graph and self.use_fa2_nvfp4_kv:
+            parallel_draft_multiplier = (
+                2
+                if speculative_config is not None
+                and speculative_config.parallel_drafting
+                else 1
+            )
+            self._uniform_decode_query_len = (
+                1 + parallel_draft_multiplier * num_spec_tokens
+            )
+            self._prefill_cudagraph_max_bs = (
+                self._uniform_decode_query_len * max_num_reqs
+            )
+            if self.compilation_config.max_cudagraph_capture_size is not None:
+                self._prefill_cudagraph_max_bs = min(
+                    self._prefill_cudagraph_max_bs,
+                    self.compilation_config.max_cudagraph_capture_size,
+                )
+            self._prefill_wrappers_cudagraph: dict[
+                int, BatchPrefillWithPagedKVCacheWrapper
+            ] = {}
 
         # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
         # decode phases require different Q dtypes when the KV cache is FP8
@@ -816,6 +877,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if can_use_xqa_or_trtllm_gen_decode
             else None
         )
+        if self.use_fa2_nvfp4_kv:
+            # Neither the dedicated XQA API nor trtllm-gen read NVFP4 KV on
+            # SM12x; decode (incl. spec-decode verify) goes through the native
+            # FA2 decode/prefill wrappers.
+            self.use_trtllm_decode_attention = False
+            self.flashinfer_trtllm_api_decode_kernel = None
         # The dedicated FlashInfer XQA API accepts head dimensions in
         # [16, 256] that are divisible by 16. Some hybrid-attention models
         # (for example Gemma 4) use XQA-compatible sliding-attention groups
@@ -931,6 +998,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             max_num_reqs, dtype=torch.int32, device=self.device, pin_memory=False
         )
 
+        if self.enable_cuda_graph and self.use_fa2_nvfp4_kv:
+            self._prefill_qo_indptr_gpu = torch.zeros(
+                max_num_reqs + 1, dtype=torch.int32, device=self.device
+            )
+
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
         return self.cache_config.get_resolved_kv_cache_layout()
@@ -970,6 +1042,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
             return self.model_config.dtype
         if cache_dtype.startswith("nvfp4"):
+            if current_platform.is_device_capability_family(120):
+                # SM12x FA2 takes BF16/FP16 Q and dequantizes NVFP4 KV in-kernel
+                return self.model_config.dtype
             return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
         return self.kv_cache_spec.dtype
 
@@ -1113,6 +1188,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_prefill_wrapper(
         self,
         causal: bool = True,
+        batch_size: int = 0,
+        use_cudagraph: bool = False,
     ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
         if not causal:
             if self.use_dcp:
@@ -1148,6 +1225,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     )
             return self._noncausal_prefill_wrapper
 
+        if use_cudagraph:
+            assert self.use_fa2_nvfp4_kv
+            wrapper = self._prefill_wrappers_cudagraph.get(batch_size, None)
+            if wrapper is None:
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    self._get_workspace_buffer(),
+                    get_flashinfer_layout_string(self.kv_cache_layout),
+                    use_cuda_graph=True,
+                    qo_indptr_buf=self._prefill_qo_indptr_gpu[: batch_size + 1],
+                    paged_kv_indptr_buf=self.paged_kv_indptr.gpu[: batch_size + 1],
+                    paged_kv_indices_buf=self.paged_kv_indices,
+                    paged_kv_last_page_len_buf=(
+                        self.paged_kv_last_page_len.gpu[:batch_size]
+                    ),
+                    backend="auto",
+                )
+                self._prefill_wrappers_cudagraph[batch_size] = wrapper
+            return wrapper
+
         if self._prefill_wrapper is None:
             if self.use_dcp:
                 self._prefill_wrapper = BatchDCPPrefillWrapper(
@@ -1169,9 +1265,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         window_left=self.window_left,
                     )
                 else:
-                    # NVFP4 KV cache requires the trtllm-gen backend inside
-                    # the wrapper; fa2/fa3 do not support nvfp4.
-                    backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
+                    # NVFP4 on SM100 requires the trtllm-gen backend inside
+                    # the wrapper; SM120 uses the FA2 backend (auto).
+                    if self.is_kvcache_nvfp4 and not self.use_fa2_nvfp4_kv:
+                        backend = "trtllm-gen"
+                    else:
+                        backend = "auto"
                     self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                         self._get_workspace_buffer(),
                         get_flashinfer_layout_string(self.kv_cache_layout),
@@ -1195,9 +1294,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr = None
                 paged_kv_indices = None
                 paged_kv_last_page_len = None
-            # NVFP4 KV cache requires the trtllm-gen backend inside
-            # the wrapper; fa2/fa3 do not support nvfp4.
-            backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
+            # NVFP4 on SM100 requires trtllm-gen backend;
+            # SM120 uses the fa2 backend.
+            if self.is_kvcache_nvfp4:
+                backend = "fa2" if self.use_fa2_nvfp4_kv else "trtllm-gen"
+            else:
+                backend = "auto"
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_flashinfer_layout_string(self.kv_cache_layout),
@@ -1512,7 +1614,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
                 q_data_type=self.q_data_type_prefill,
-                kv_data_type=self.kv_cache_dtype,
+                kv_data_type=(
+                    torch.uint8 if self.use_fa2_nvfp4_kv else self.kv_cache_dtype
+                ),
             )
             return attn_metadata
 
@@ -1563,7 +1667,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                prefill_use_cudagraph = (
+                    self.use_fa2_nvfp4_kv
+                    and self.enable_cuda_graph
+                    and not self.use_dcp
+                    and num_decodes == 0
+                    and num_prefill_tokens <= self._prefill_cudagraph_max_bs
+                    and num_prefill_tokens
+                    == num_prefills * self._uniform_decode_query_len
+                )
+                prefill_wrapper = self._get_prefill_wrapper(
+                    causal=attn_metadata.causal,
+                    batch_size=num_prefills if prefill_use_cudagraph else 0,
+                    use_cudagraph=prefill_use_cudagraph,
+                )
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1612,7 +1729,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type_prefill,
-                        kv_cache_dtype=self.kv_cache_dtype,
+                        kv_cache_dtype=(
+                            torch.uint8
+                            if self.use_fa2_nvfp4_kv
+                            else self.kv_cache_dtype
+                        ),
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
@@ -1621,11 +1742,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         prefill_wrapper,
                         BatchPrefillWithPagedKVCacheWrapper,
                     )
-                    # NVFP4 trtllm kernel only supports FP8 output;
-                    # use FP8 o_data_type so the wrapper matches the
-                    # FP8 output buffer allocated in forward().
+                    # SM120 FA2 outputs BF16 directly; SM100 trtllm-gen
+                    # only supports FP8 output and needs dequantization.
                     o_dtype = (
-                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+                        self.model_config.dtype
+                        if (self.is_kvcache_nvfp4 and self.use_fa2_nvfp4_kv)
+                        else FP8_DTYPE
+                        if self.is_kvcache_nvfp4
+                        else self.model_config.dtype
                     )
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
@@ -1642,7 +1766,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type_prefill,
-                        kv_data_type=self.kv_cache_dtype,
+                        kv_data_type=(
+                            torch.uint8
+                            if self.use_fa2_nvfp4_kv
+                            else self.kv_cache_dtype
+                        ),
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
@@ -1717,11 +1845,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.
-                # NVFP4 trtllm kernel only supports FP8 output;
-                # use FP8 o_data_type so the wrapper matches the
-                # FP8 output buffer allocated in forward().
+                # SM120 FA2 outputs BF16 directly; SM100 trtllm-gen
+                # only supports FP8 output and needs dequantization.
                 o_dtype = (
-                    FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+                    self.model_config.dtype
+                    if (self.is_kvcache_nvfp4 and self.use_fa2_nvfp4_kv)
+                    else FP8_DTYPE
+                    if self.is_kvcache_nvfp4
+                    else self.model_config.dtype
                 )
                 paged_kv_indptr_cpu = self.paged_kv_indptr.cpu[: num_input_tokens + 1]
                 paged_kv_last_page_len_cpu = self.paged_kv_last_page_len.cpu[
@@ -1759,7 +1890,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     window_left=self.window_left,
                     logits_soft_cap=self.logits_soft_cap,
                     q_data_type=self.q_data_type_decode,
-                    kv_data_type=self.kv_cache_dtype,
+                    kv_data_type=(
+                        torch.uint8 if self.use_fa2_nvfp4_kv else self.kv_cache_dtype
+                    ),
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
@@ -1811,6 +1944,9 @@ class FlashInferImpl(AttentionImpl):
         )
         self.cache_dtype = kv_cache_dtype
         self.is_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
+        self.use_fa2_nvfp4_kv = (
+            self.is_kvcache_nvfp4 and current_platform.is_device_capability_family(120)
+        )
         self.kv_cache_dtype = "nvfp4" if self.is_kvcache_nvfp4 else kv_cache_dtype
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
         self.logits_soft_cap = logits_soft_cap
@@ -1859,7 +1995,12 @@ class FlashInferImpl(AttentionImpl):
         self.o_sf_scale: float | None = None
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
-        if self.is_kvcache_nvfp4 and vllm_config is not None:
+        # SM120 FA2 outputs BF16 directly, so only SM100 trtllm-gen needs this.
+        if (
+            self.is_kvcache_nvfp4
+            and not self.use_fa2_nvfp4_kv
+            and vllm_config is not None
+        ):
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             self._nvfp4_fp8_out = torch.empty(
                 (max_num_tokens, num_heads, head_size),
@@ -2186,11 +2327,13 @@ class FlashInferImpl(AttentionImpl):
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     )
 
-                    # NVFP4 trtllm kernel only supports FP8 output.
-                    # Use a pre-allocated FP8 buffer and dequantize
-                    # afterwards.
+                    # SM100 trtllm-gen kernel only supports FP8 output;
+                    # use a pre-allocated FP8 buffer and dequantize afterwards.
+                    # SM120 FA2 outputs BF16 directly, no intermediate needed.
                     needs_fp8_out_prefill = (
-                        self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                        self.is_kvcache_nvfp4
+                        and not self.use_fa2_nvfp4_kv
+                        and output.dtype != FP8_DTYPE
                     )
                     if needs_fp8_out_prefill:
                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
@@ -2358,9 +2501,14 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache_for_fi = kv_cache_tuple
                 kv_cache_sf = nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
 
-                # NVFP4 kernel only supports FP8 output.
-                # Use a pre-allocated FP8 buffer and dequantize afterwards.
-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                # SM100 trtllm-gen kernel only supports FP8 output;
+                # use a pre-allocated FP8 buffer and dequantize afterwards.
+                # SM120 FA2 outputs BF16 directly, no intermediate needed.
+                needs_fp8_out = (
+                    self.is_kvcache_nvfp4
+                    and not self.use_fa2_nvfp4_kv
+                    and output.dtype != FP8_DTYPE
+                )
                 if needs_fp8_out:
                     out_decode = self._nvfp4_fp8_out[:num_decode_tokens]
                 else:
